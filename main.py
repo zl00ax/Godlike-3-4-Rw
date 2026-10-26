@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Godlike 主机自动续期 + 开机脚本
+Godlike 主机自动续期 + 开机脚本 (增强修复版)
 """
 
 import os, sys, time, traceback, random, json, re, asyncio
@@ -19,6 +19,11 @@ LOGIN_URL = f"{FRONT_BASE}/login"
 OUTPUT_DIR = Path("scripts/Godlike")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 CN_TZ = timezone(timedelta(hours=8))
+
+UUID_PATTERN = re.compile(
+    r'\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b',
+    re.IGNORECASE
+)
 
 # ---------- 工具函数 ----------
 def cn_time():
@@ -39,27 +44,24 @@ def mask_server(server_id: str) -> str:
         return "***"
     return f"{server_id[:3]}***"
 
-def snapshot(name: str) -> str:
-    return str(OUTPUT_DIR / f"{name}_{int(time.time())}.png")
+def get_proxies(proxy: str = None) -> Optional[dict]:
+    if not proxy:
+        proxy = os.environ.get("PROXY_SERVER", "").strip()
+    if proxy:
+        return {"http": proxy, "https": proxy}
+    return None
 
 def notify_tg(ok: bool, email: str = "", server: str = "",
               before: str = "", after: str = "",
               cooldown: str = "", remaining: str = "",
               start_note: str = "",
               error_msg: str = "", screenshot: str = None):
-    """TG通知使用真实邮箱和服务器ID
-
-    Args:
-        cooldown: 下次可续期时间 (如 "23h 59m")
-        remaining: 服务器剩余时间 (如 "23h 59m")
-        start_note: 开机状态 (如 "✅ 服务器已在运行中，无需开机")
-    """
+    """TG通知使用真实邮箱和服务器ID"""
     token = os.environ.get("TG_BOT_TOKEN")
     chat_id = os.environ.get("TG_CHAT_ID")
     if not token or not chat_id:
         return
 
-    # 兼容旧调用: 如果只传了 after, 拆分成 cooldown 和 start_note
     if after and not cooldown and not start_note:
         parts = after.split("\n", 1)
         cooldown = parts[0]
@@ -95,7 +97,6 @@ def notify_tg(ok: bool, email: str = "", server: str = "",
         msg += f"📊原因: {error_msg}"
 
     try:
-        # 统一纯文本通知 (不发送截图, 保持简洁格式)
         requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": msg, "disable_web_page_preview": True},
@@ -104,8 +105,107 @@ def notify_tg(ok: bool, email: str = "", server: str = "",
     except Exception as e:
         print(f"[WARN] TG 通知发送失败: {e}", flush=True)
 
+# ---------- API 公共 headers ----------
+def api_headers(bearer_token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {bearer_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": FRONT_BASE,
+        "Referer": f"{FRONT_BASE}/",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+
+# ---------- 从 JSON 结构中递归提取服务器 UUID ----------
+def extract_uuid_from_json(data) -> Tuple[Optional[str], Optional[str]]:
+    """从 API 响应 JSON 中提取 full_uuid 和 short_id"""
+    if isinstance(data, dict):
+        # 常见 Pterodactyl / Godlike 服务器对象结构
+        attrs = data.get("attributes", data)
+        if isinstance(attrs, dict):
+            u = attrs.get("uuid") or attrs.get("server_uuid")
+            sid = attrs.get("identifier") or attrs.get("short_id") or attrs.get("uuidShort")
+            if isinstance(u, str) and UUID_PATTERN.fullmatch(u):
+                return u, (sid if isinstance(sid, str) and len(sid) == 8 else u.split("-")[0])
+
+        for k, v in data.items():
+            if k in ("uuid", "server_uuid", "serverId") and isinstance(v, str) and UUID_PATTERN.fullmatch(v):
+                return v, v.split("-")[0]
+            res_u, res_s = extract_uuid_from_json(v)
+            if res_u:
+                return res_u, res_s
+
+    elif isinstance(data, list):
+        for item in data:
+            res_u, res_s = extract_uuid_from_json(item)
+            if res_u:
+                return res_u, res_s
+
+    return None, None
+
+# ---------- 主动请求 API 获取服务器列表 (核心兜底) ----------
+def fetch_server_from_api(bearer_token: str, short_id: str = None, proxy: str = None) -> Tuple[Optional[str], Optional[str], bool]:
+    """
+    通过 Bearer Token 直接查询 API 获取服务器 UUID
+    返回: (full_uuid, short_id, is_empty_account)
+    """
+    headers = api_headers(bearer_token)
+    proxies = get_proxies(proxy)
+
+    candidate_urls = [
+        f"{API_BASE}/servers?page=1",
+        f"{API_BASE}/servers",
+        "https://panel.godlike.host/api/client?page=1",
+        "https://panel.godlike.host/api/client",
+        f"{FRONT_BASE}/api/client?page=1",
+        f"{FRONT_BASE}/api/v2/servers?page=1",
+    ]
+    if short_id:
+        candidate_urls.insert(0, f"{API_BASE}/servers/{short_id}")
+        candidate_urls.insert(1, f"https://panel.godlike.host/api/client/servers/{short_id}")
+
+    empty_account_detected = False
+
+    for url in candidate_urls:
+        try:
+            resp = requests.get(url, headers=headers, proxies=proxies, timeout=15)
+            if resp.status_code != 200:
+                continue
+
+            try:
+                data = resp.json()
+            except Exception:
+                continue
+
+            # 1. 尝试结构化提取
+            u, s = extract_uuid_from_json(data)
+            if u:
+                print(f"[DEBUG] 通过 API ({url}) 成功获取到服务器 UUID", flush=True)
+                return u, s, False
+
+            # 2. 检查是否明确返回了空的服务器列表
+            if isinstance(data, dict):
+                arr = data.get("data")
+                if isinstance(arr, list) and len(arr) == 0:
+                    empty_account_detected = True
+
+            # 3. 退化为正则全文匹配（排除 user 自身的 uuid）
+            text = resp.text
+            if short_id:
+                m = re.search(rf'{re.escape(short_id)}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}', text, re.I)
+                if m:
+                    return m.group(0), short_id, False
+
+        except Exception as e:
+            print(f"[DEBUG] 请求 {url} 异常: {e}", flush=True)
+
+    return None, short_id, empty_account_detected
+
 # ---------- 登录并获取 Bearer Token + UUID ----------
-def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optional[str], Optional[str], Optional[str], str]:
+    """
+    返回: (bearer_token, full_uuid, short_id, error_reason)
+    """
     bearer_token = None
     full_uuid = None
     short_id = None
@@ -118,26 +218,46 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
             if bearer_token != token:
                 bearer_token = token
         url = request.url
-        m = re.search(r'/servers/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', url)
+        m = re.search(r'/servers/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', url, re.I)
         if m and not full_uuid:
             full_uuid = m.group(1)
             short_id = full_uuid.split('-')[0]
+
+    def on_response(response):
+        nonlocal full_uuid, short_id
+        if full_uuid:
+            return
+        url = response.url
+        if any(k in url for k in ("/api/", "/servers", "/client")):
+            try:
+                ctype = response.headers.get("content-type", "")
+                if "json" in ctype:
+                    data = response.json()
+                    u, s = extract_uuid_from_json(data)
+                    if u:
+                        full_uuid = u
+                        short_id = s or u.split("-")[0]
+                        print(f"[DEBUG] 从响应拦截中获取 UUID: {mask_server(short_id)}", flush=True)
+            except Exception:
+                pass
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
             proxy={"server": proxy} if proxy else None,
-            args=["--no-sandbox", "--disable-setuid-sandbox"]
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
         )
         context = browser.new_context(
             extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            viewport={"width": 1280, "height": 800}
         )
         page = context.new_page()
         page.on("request", on_request)
+        page.on("response", on_response)
 
         try:
             print(f"[DEBUG] 正在打开登录页: {LOGIN_URL}", flush=True)
-            page.goto(LOGIN_URL, wait_until="domcontentloaded")
+            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(3000)
             print(f"[DEBUG] 当前 URL: {page.url}", flush=True)
 
@@ -150,10 +270,10 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
                 print(f"[ERROR] 未找到 'Through login/password' 按钮: {e}", flush=True)
                 try:
                     page.screenshot(path="login_no_switch_btn.png")
-                    print(f"[DEBUG] 已截图: login_no_switch_btn.png (页面标题: {page.title()})", flush=True)
-                except:
+                except Exception:
                     pass
-                return None, None, None
+                return None, None, None, "未找到登录切换按钮(可能遇到Cloudflare拦截)"
+
             page.wait_for_timeout(2000)
 
             try:
@@ -164,10 +284,9 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
                 print(f"[ERROR] 未找到输入框: {e}", flush=True)
                 try:
                     page.screenshot(path="login_no_input.png")
-                    print(f"[DEBUG] 已截图: login_no_input.png (页面标题: {page.title()})", flush=True)
-                except:
+                except Exception:
                     pass
-                return None, None, None
+                return None, None, None, "未找到账号密码输入框"
 
             page.fill('input[placeholder="Username or Email"]', user)
             page.fill('input[placeholder="Password"]', pwd)
@@ -182,199 +301,164 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
                         login_clicked = True
                         print(f"[DEBUG] 已点击登录按钮: {sel}", flush=True)
                         break
-                except:
+                except Exception:
                     pass
+
             if not login_clicked:
                 print("[ERROR] 未找到登录按钮", flush=True)
-                try:
-                    page.screenshot(path="login_no_btn.png")
-                except:
-                    pass
-                return None, None, None
+                return None, None, None, "未找到登录提交按钮"
 
-            page.wait_for_timeout(5000)
+            # 等待跳转并让网络请求完成
+            page.wait_for_timeout(6000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
             print(f"[DEBUG] 登录后 URL: {page.url}", flush=True)
 
-            # === 详细诊断：捕获登录失败的原因 ===
-            # 1. 检查 URL 是否还在登录页
             if '/login' in page.url:
                 print("[ERROR] 登录后仍在登录页，登录被拒绝", flush=True)
                 try:
                     page.screenshot(path="login_rejected.png", full_page=True)
-                    print("[DEBUG] 已截图: login_rejected.png", flush=True)
-                except:
+                except Exception:
+                    pass
+                return None, None, None, "登录被拒绝(密码错误或触发验证码)"
+
+            # 尝试从存储中兜底提取 ptlc_ token
+            if not bearer_token:
+                try:
+                    storage_text = page.evaluate(
+                        "() => JSON.stringify(Object.assign({}, localStorage, sessionStorage)) + ' ' + document.cookie"
+                    )
+                    m_tok = re.search(r'(ptlc_[A-Za-z0-9_\-]+)', storage_text)
+                    if m_tok:
+                        bearer_token = m_tok.group(1)
+                        print("[DEBUG] 从浏览器 Storage 中提取到 bearer_token", flush=True)
+                except Exception:
                     pass
 
-                # 2. 读取页面上所有可见的错误提示文本
-                try:
-                    print("[DEBUG] === 页面可见文本诊断 ===", flush=True)
-                    # 常见错误提示选择器
-                    error_selectors = [
-                        '.alert', '.alert-danger', '.error', '.error-message',
-                        '[class*="error"]', '[class*="Error"]',
-                        '[role="alert"]', '.text-red', '.text-danger',
-                        '.invalid-feedback', '.form-error',
-                        'div:text-matches("invalid|incorrect|failed|error|wrong|错误|失败|无效", "i")',
-                    ]
-                    for sel in error_selectors:
-                        try:
-                            els = page.locator(sel)
-                            cnt = els.count()
-                            for i in range(min(cnt, 3)):
-                                txt = els.nth(i).inner_text(timeout=1000).strip()
-                                if txt and len(txt) < 500:
-                                    print(f"[ERROR] 错误提示 ({sel}): {txt}", flush=True)
-                        except:
-                            pass
-
-                    # 3. 读取整个页面的文本（前 1000 字符），找错误关键词
-                    body_text = page.locator('body').inner_text(timeout=3000)
-                    # 找包含错误关键词的行
-                    keywords = ['invalid', 'incorrect', 'failed', 'error', 'wrong',
-                                'disabled', 'blocked', 'captcha', 'verify', 'recaptcha',
-                                '错误', '失败', '无效', '验证', '锁定', '禁止']
-                    for line in body_text.split('\n'):
-                        line_stripped = line.strip()
-                        if line_stripped and any(kw in line_stripped.lower() for kw in keywords):
-                            if 5 < len(line_stripped) < 300:
-                                print(f"[ERROR] 页面文本: {line_stripped}", flush=True)
-                except Exception as e:
-                    print(f"[DEBUG] 读取页面文本失败: {e}", flush=True)
-
-                # 4. 检查是否有 reCAPTCHA / hCaptcha / Turnstile
-                try:
-                    captcha_selectors = [
-                        'iframe[src*="recaptcha"]', 'iframe[src*="hcaptcha"]',
-                        'iframe[src*="challenges.cloudflare.com"]',
-                        '.g-recaptcha', '.h-captcha', '.cf-turnstile',
-                        '[data-sitekey]'
-                    ]
-                    for sel in captcha_selectors:
-                        try:
-                            cnt = page.locator(sel).count()
-                            if cnt > 0:
-                                print(f"[ERROR] 检测到验证码: {sel} (共 {cnt} 个)", flush=True)
-                        except:
-                            pass
-                except:
-                    pass
-
-                # 5. 检查输入框是否有错误样式 (红框等)
-                try:
-                    for input_sel in ['input[placeholder="Username or Email"]', 'input[placeholder="Password"]']:
-                        try:
-                            el = page.locator(input_sel).first
-                            class_name = el.get_attribute("class") or ""
-                            if "error" in class_name.lower() or "invalid" in class_name.lower():
-                                print(f"[ERROR] 输入框有错误样式: {input_sel} class='{class_name}'", flush=True)
-                        except:
-                            pass
-                except:
-                    pass
-
-            # 原有的简单错误提示检查
-            try:
-                error_texts = ['Invalid', 'incorrect', 'failed', 'error', '错误', '失败']
-                for et in error_texts:
-                    el = page.locator(f'text="{et}"')
-                    if el.count() > 0 and el.first.is_visible():
-                        print(f"[ERROR] 登录错误提示: {et}", flush=True)
-                        break
-            except:
-                pass
-
-            for _ in range(5):
-                for sel in ['button:has-text("Go to my server")', 'button:has-text("Skip")']:
+            # 尝试点击弹窗或引导按钮，并检测服务器卡片
+            for _ in range(8):
+                if full_uuid:
+                    break
+                for sel in [
+                    'button:has-text("Go to my server")',
+                    'button:has-text("Skip")',
+                    'a[href*="/server/"]',
+                ]:
                     try:
                         el = page.locator(sel)
                         if el.count() > 0 and el.first.is_visible():
-                            el.first.click()
-                            print(f"[DEBUG] 已点击: {sel}", flush=True)
-                            page.wait_for_timeout(2000)
+                            href = el.first.get_attribute("href") or ""
+                            if "/server/" in href and not short_id:
+                                parts = href.rstrip('/').split('/')
+                                for j, p_part in enumerate(parts):
+                                    if p_part == 'server' and j + 1 < len(parts) and len(parts[j + 1]) == 8:
+                                        short_id = parts[j + 1]
+                                        break
+                            el.first.click(timeout=3000)
+                            print(f"[DEBUG] 已点击页面元素: {sel}", flush=True)
+                            page.wait_for_timeout(2500)
                             break
-                    except:
+                    except Exception:
                         pass
+
                 if '/server/' in page.url:
                     print(f"[DEBUG] 已进入服务器页: {page.url}", flush=True)
+                    parts = page.url.rstrip('/').split('/')
+                    for i, p_part in enumerate(parts):
+                        if p_part == 'server' and i + 1 < len(parts) and len(parts[i + 1]) == 8:
+                            short_id = parts[i + 1]
+                            break
                     break
                 page.wait_for_timeout(1000)
+
+            # 如果拿到了 short_id 但还没进服务器详情页，主动跳转触发详情 API
+            if short_id and not full_uuid:
+                try:
+                    print(f"[DEBUG] 主动访问服务器详情页: {FRONT_BASE}/server/{short_id}", flush=True)
+                    page.goto(f"{FRONT_BASE}/server/{short_id}", wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(4000)
+                except Exception:
+                    pass
+
+            # 从网页 HTML 源码正则兜底匹配
+            if not full_uuid:
+                try:
+                    html = page.content()
+                    if short_id:
+                        m = re.search(
+                            rf'{re.escape(short_id)}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}',
+                            html, re.I
+                        )
+                        if m:
+                            full_uuid = m.group(0)
+                    else:
+                        # 查找页面中是否存在 href="/server/xxxxxxxx"
+                        m_short = re.search(r'/server/([0-9a-f]{8})\b', html, re.I)
+                        if m_short:
+                            short_id = m_short.group(1)
+                            m_full = re.search(
+                                rf'{re.escape(short_id)}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}',
+                                html, re.I
+                            )
+                            if m_full:
+                                full_uuid = m_full.group(0)
+                except Exception:
+                    pass
+
+            # 如果依然没拿到 UUID，但已经有了 bearer_token，直接调后端 API 查询！
+            empty_account = False
+            if bearer_token and not full_uuid:
+                print("[DEBUG] 正在通过 Bearer Token 主动查询服务器列表 API...", flush=True)
+                api_uuid, api_short, empty_account = fetch_server_from_api(bearer_token, short_id, proxy)
+                if api_uuid:
+                    full_uuid = api_uuid
+                    short_id = api_short or full_uuid.split('-')[0]
+
+            # 如果还是失败，截图留存并在日志打印页面可见文字方便排查
+            if not full_uuid:
+                try:
+                    snap_file = f"no_uuid_{int(time.time())}.png"
+                    page.screenshot(path=snap_file, full_page=True)
+                    body_preview = page.locator("body").inner_text(timeout=3000)
+                    clean_preview = " | ".join([line.strip() for line in body_preview.splitlines() if line.strip()][:15])
+                    print(f"[DEBUG] 未获取到 UUID 时页面文本预览: {clean_preview}", flush=True)
+                except Exception:
+                    pass
 
             print(f"[DEBUG] 最终 URL: {page.url}", flush=True)
             print(f"[DEBUG] bearer_token: {'已获取' if bearer_token else '未获取'}, short_id: {short_id or '未获取'}", flush=True)
 
-            if not short_id:
-                if '/server/' in page.url:
-                    parts = page.url.rstrip('/').split('/')
-                    for i, p_part in enumerate(parts):
-                        if p_part == 'server' and i+1 < len(parts) and len(parts[i+1]) == 8:
-                            short_id = parts[i+1]
-                            break
-                if not short_id:
-                    links = page.locator('a[href*="/server/"]')
-                    for i in range(links.count()):
-                        href = links.nth(i).get_attribute("href") or ""
-                        parts = href.rstrip('/').split('/')
-                        for j, p_part in enumerate(parts):
-                            if p_part == 'server' and j+1 < len(parts) and len(parts[j+1]) == 8:
-                                short_id = parts[j+1]
-                                break
-                        if short_id:
-                            break
+            if empty_account and not full_uuid:
+                return bearer_token, None, None, "该账号下暂无服务器(可能未创建或过期已被系统回收)"
 
-            if short_id and not bearer_token:
-                page.goto(f"{FRONT_BASE}/server/{short_id}", wait_until="domcontentloaded")
-                page.wait_for_load_state("networkidle")
-                page.wait_for_timeout(3000)
-
-            if not full_uuid and short_id:
-                try:
-                    html = page.content()
-                    m = re.search(
-                        rf'{re.escape(short_id)}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}',
-                        html
-                    )
-                    if m:
-                        full_uuid = m.group(0)
-                except:
-                    pass
-
-            return bearer_token, full_uuid, short_id
+            return bearer_token, full_uuid, short_id, ("未能获取服务器 UUID" if not full_uuid else "")
 
         except Exception as e:
             print(f"[ERROR] 登录异常: {e}", flush=True)
             traceback.print_exc()
-            return None, None, None
+            return None, None, None, f"登录异常: {str(e)[:100]}"
         finally:
             context.close()
             browser.close()
 
-# ---------- API 公共 headers ----------
-def api_headers(bearer_token: str) -> dict:
-    return {
-        "Authorization": f"Bearer {bearer_token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/plain, */*",
-        "Origin": FRONT_BASE,
-        "Referer": f"{FRONT_BASE}/",
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    }
-
 # ---------- 检查续期状态 ----------
-def check_video_status(full_uuid: str, bearer_token: str) -> dict:
+def check_video_status(full_uuid: str, bearer_token: str, proxy: str = None) -> dict:
     url = f"{API_BASE}/servers/{full_uuid}/free-renewal/video/status?type=youtube_iter1&locale=en"
     try:
-        resp = requests.get(url, headers=api_headers(bearer_token), timeout=30)
+        resp = requests.get(url, headers=api_headers(bearer_token), proxies=get_proxies(proxy), timeout=30)
         return resp.json()
     except Exception as e:
         print(f"[ERROR] 状态查询失败: {e}", flush=True)
         return {}
 
 # ---------- 调用 start API ----------
-def call_video_start(full_uuid: str, bearer_token: str) -> dict:
+def call_video_start(full_uuid: str, bearer_token: str, proxy: str = None) -> dict:
     url = f"{API_BASE}/servers/{full_uuid}/free-renewal/video/start?locale=en"
     body = {"type": "youtube_iter1"}
     try:
-        resp = requests.post(url, headers=api_headers(bearer_token), json=body, timeout=30)
+        resp = requests.post(url, headers=api_headers(bearer_token), json=body, proxies=get_proxies(proxy), timeout=30)
         return resp.json()
     except Exception as e:
         print(f"[ERROR] Start API失败: {e}", flush=True)
@@ -383,7 +467,7 @@ def call_video_start(full_uuid: str, bearer_token: str) -> dict:
 # ---------- 单次 update-time ----------
 def call_update_once(full_uuid: str, bearer_token: str,
                      watch_uuid: str, renewal_id: int,
-                     video_time: int) -> dict:
+                     video_time: int, proxy: str = None) -> dict:
     url = f"{API_BASE}/servers/{full_uuid}/free-renewal/video/update-time?locale=en"
     body = {
         "uuid": watch_uuid,
@@ -392,7 +476,7 @@ def call_update_once(full_uuid: str, bearer_token: str,
         "video_time_watched": video_time,
     }
     try:
-        resp = requests.post(url, headers=api_headers(bearer_token), json=body, timeout=30)
+        resp = requests.post(url, headers=api_headers(bearer_token), json=body, proxies=get_proxies(proxy), timeout=30)
         return resp.json()
     except Exception as e:
         print(f"[ERROR] update-time异常: {e}", flush=True)
@@ -400,7 +484,7 @@ def call_update_once(full_uuid: str, bearer_token: str,
 
 # ---------- 模拟视频观看 ----------
 def simulate_video_watching(full_uuid: str, bearer_token: str,
-                             watch_uuid: str, renewal_id: int) -> Tuple[bool, str]:
+                             watch_uuid: str, renewal_id: int, proxy: str = None) -> Tuple[bool, str]:
     steps = [30, 60, 90, 120, 150, 180, 210, 240]
     wait_seconds = 28
     total = len(steps) * wait_seconds
@@ -412,7 +496,7 @@ def simulate_video_watching(full_uuid: str, bearer_token: str,
         print(f"[INFO] 步骤 {i+1}/{len(steps)} 等待{wait_seconds}s → 上报{video_time}s", flush=True)
         time.sleep(wait_seconds)
 
-        resp = call_update_once(full_uuid, bearer_token, watch_uuid, renewal_id, video_time)
+        resp = call_update_once(full_uuid, bearer_token, watch_uuid, renewal_id, video_time, proxy)
         last_resp = resp
 
         success = resp.get("success", False)
@@ -426,7 +510,7 @@ def simulate_video_watching(full_uuid: str, bearer_token: str,
                     adjusted = current + 30
                     print(f"[WARN] 时间偏差，调整为{adjusted}s重试", flush=True)
                     time.sleep(2)
-                    resp2 = call_update_once(full_uuid, bearer_token, watch_uuid, renewal_id, adjusted)
+                    resp2 = call_update_once(full_uuid, bearer_token, watch_uuid, renewal_id, adjusted, proxy)
                     if resp2.get("success"):
                         last_resp = resp2
                         new_timer = resp2.get("new_free_timer")
@@ -448,10 +532,10 @@ def simulate_video_watching(full_uuid: str, bearer_token: str,
     return False, last_resp.get("message", "未知错误")
 
 # ---------- 获取 WS JWT ----------
-def get_websocket_credentials(full_uuid: str, bearer_token: str) -> Tuple[Optional[str], Optional[str]]:
+def get_websocket_credentials(full_uuid: str, bearer_token: str, proxy: str = None) -> Tuple[Optional[str], Optional[str]]:
     url = f"{API_BASE}/servers/{full_uuid}/websocket?locale=en"
     try:
-        resp = requests.get(url, headers=api_headers(bearer_token), timeout=30)
+        resp = requests.get(url, headers=api_headers(bearer_token), proxies=get_proxies(proxy), timeout=30)
         if resp.status_code == 200:
             data = resp.json().get("data", resp.json())
             return data.get("token"), data.get("socket")
@@ -463,14 +547,6 @@ def get_websocket_credentials(full_uuid: str, bearer_token: str) -> Tuple[Option
 
 # ---------- WebSocket 开机 ----------
 async def ws_start_server(socket_url: str, jwt: str) -> str:
-    """
-    返回值:
-      "already_running" - 服务器已在运行，无需开机
-      "started"         - 已发送开机指令并确认启动
-      "sent"            - 已发送开机指令，等待超时但指令已发出
-      "auth_failed"     - WS认证失败
-      "error"           - 其他异常
-    """
     print(f"[INFO] 连接 WebSocket...", flush=True)
     try:
         async with websockets.connect(
@@ -483,7 +559,6 @@ async def ws_start_server(socket_url: str, jwt: str) -> str:
             ping_timeout=20,
             close_timeout=10,
         ) as ws:
-            # 认证
             await ws.send(json.dumps({"event": "auth", "args": [jwt]}))
 
             auth_success = False
@@ -502,7 +577,6 @@ async def ws_start_server(socket_url: str, jwt: str) -> str:
                 print("[ERROR] WS认证失败", flush=True)
                 return "auth_failed"
 
-            # 收集服务器推送的初始状态（最多等 5s）
             current_status = "unknown"
             deadline = asyncio.get_event_loop().time() + 5
             while asyncio.get_event_loop().time() < deadline:
@@ -532,16 +606,13 @@ async def ws_start_server(socket_url: str, jwt: str) -> str:
                 except Exception:
                     break
 
-            # 已在运行/启动中 → 无需发开机指令
             if current_status in ("running", "starting"):
                 print(f"[INFO] 服务器已在运行中（{current_status}），无需开机", flush=True)
                 return "already_running"
 
-            # 未运行 → 发送开机指令
             await ws.send(json.dumps({"event": "set state", "args": ["start"]}))
             print("[INFO] 已发送开机指令，等待启动...", flush=True)
 
-            # 等待状态变更确认
             for _ in range(60):
                 try:
                     msg = await asyncio.wait_for(ws.recv(), timeout=5)
@@ -576,9 +647,8 @@ async def ws_start_server(socket_url: str, jwt: str) -> str:
         print(f"[ERROR] WebSocket异常: {e}", flush=True)
         return "error"
 
-
-def start_server_via_ws(full_uuid: str, bearer_token: str) -> str:
-    jwt, socket_url = get_websocket_credentials(full_uuid, bearer_token)
+def start_server_via_ws(full_uuid: str, bearer_token: str, proxy: str = None) -> str:
+    jwt, socket_url = get_websocket_credentials(full_uuid, bearer_token, proxy)
     if not jwt or not socket_url:
         print("[ERROR] 无法获取WS凭证", flush=True)
         return "error"
@@ -603,36 +673,39 @@ def process_account(key: str, proxy: str = None) -> bool:
         notify_tg(False, error_msg="格式错误")
         return False
 
-    # 工作流日志使用脱敏值
     masked = mask_email(user)
     print(f"\n{'='*60}", flush=True)
     print(f"[INFO] 处理 {key} ({masked})", flush=True)
     print(f"{'='*60}", flush=True)
 
-    # 1. 登录
-    bearer_token, full_uuid, short_id = login_and_get_token(user, pwd, proxy)
+    # 1. 登录并获取 Token 和 UUID
+    bearer_token, full_uuid, short_id, err_reason = login_and_get_token(user, pwd, proxy)
     if not bearer_token:
-        print("[ERROR] 未能获取 Bearer Token", flush=True)
-        notify_tg(False, email=user, error_msg="未能获取 Bearer Token")
+        msg = err_reason or "未能获取 Bearer Token"
+        print(f"[ERROR] {msg}", flush=True)
+        notify_tg(False, email=user, error_msg=msg)
         return False
     if not full_uuid:
-        print("[ERROR] 未能获取服务器 UUID", flush=True)
-        notify_tg(False, email=user, error_msg="未能获取服务器 UUID")
+        msg = err_reason or "未能获取服务器 UUID"
+        print(f"[ERROR] {msg}", flush=True)
+        notify_tg(False, email=user, error_msg=msg)
         return False
 
-    # 工作流日志中服务器ID也脱敏
+    if not short_id:
+        short_id = full_uuid.split("-")[0]
+
     masked_server = mask_server(short_id)
     print(f"[INFO] 🔑 登录成功 | 服务器: {masked_server}", flush=True)
 
     # 2. 检查续期状态
-    status = check_video_status(full_uuid, bearer_token)
+    status = check_video_status(full_uuid, bearer_token, proxy)
     can_watch = status.get("can_watch", None)
     time_until_next = status.get("time_until_next_video") or 0
 
     renew_ok = False
     cooldown_after = ""
 
-    if not can_watch and time_until_next > 0:
+    if can_watch is False and time_until_next > 0:
         h = time_until_next // 3600
         m = (time_until_next % 3600) // 60
         cooldown_after = f"{h}h {m}m"
@@ -640,7 +713,7 @@ def process_account(key: str, proxy: str = None) -> bool:
         renew_ok = True
     else:
         # 3. 续期
-        start_resp = call_video_start(full_uuid, bearer_token)
+        start_resp = call_video_start(full_uuid, bearer_token, proxy)
         if not start_resp.get("success"):
             err = start_resp.get("message", "start API失败")
             print(f"[ERROR] 续期启动失败: {err}", flush=True)
@@ -651,16 +724,15 @@ def process_account(key: str, proxy: str = None) -> bool:
         renewal_id = start_resp.get("renewal_id", 0)
         print(f"[INFO] 续期会话已建立 (renewal_id={renewal_id})", flush=True)
 
-        renew_ok, result = simulate_video_watching(full_uuid, bearer_token, watch_uuid, renewal_id)
+        renew_ok, result = simulate_video_watching(full_uuid, bearer_token, watch_uuid, renewal_id, proxy)
 
         if not renew_ok:
             print(f"[ERROR] 续期失败: {result}", flush=True)
             notify_tg(False, email=user, server=short_id, error_msg=result)
             return False
 
-        # 确认冷却时间
         time.sleep(2)
-        status_after = check_video_status(full_uuid, bearer_token)
+        status_after = check_video_status(full_uuid, bearer_token, proxy)
         time_until = status_after.get("time_until_next_video") or 0
         h = time_until // 3600
         m_min = (time_until % 3600) // 60
@@ -669,7 +741,7 @@ def process_account(key: str, proxy: str = None) -> bool:
 
     # 4. WS 开机
     print(f"[INFO] ── 开机 ──", flush=True)
-    start_result = start_server_via_ws(full_uuid, bearer_token)
+    start_result = start_server_via_ws(full_uuid, bearer_token, proxy)
 
     start_note_map = {
         "already_running": "✅ 服务器已在运行中，无需开机",
@@ -681,13 +753,13 @@ def process_account(key: str, proxy: str = None) -> bool:
     start_note = start_note_map.get(start_result, "⚠️ 未知状态")
     print(f"[INFO] {start_note}", flush=True)
 
-    # 5. TG 通知（使用真实邮箱和服务器ID）
+    # 5. TG 通知
     notify_tg(
         ok=renew_ok,
         email=user,
         server=short_id,
         cooldown=cooldown_after,
-        remaining=cooldown_after,  # Godlike 的 "下次可续期" 就是剩余时间
+        remaining=cooldown_after,
         start_note=start_note,
     )
 
@@ -695,7 +767,7 @@ def process_account(key: str, proxy: str = None) -> bool:
     return renew_ok
 
 def main():
-    proxy = os.environ.get("PROXY_SERVER", "")
+    proxy = os.environ.get("PROXY_SERVER", "").strip()
     if proxy:
         print(f"[INFO] 使用代理", flush=True)
 
