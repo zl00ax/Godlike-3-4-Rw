@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Godlike 主机自动续期 + 开机脚本 (增强修复版)
+Godlike 主机自动续期 + 开机脚本 (精准识别服务器 UUID 修复版)
 """
 
 import os, sys, time, traceback, random, json, re, asyncio
@@ -116,34 +116,56 @@ def api_headers(bearer_token: str) -> dict:
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
 
-# ---------- 从 JSON 结构中递归提取服务器 UUID ----------
-def extract_uuid_from_json(data) -> Tuple[Optional[str], Optional[str]]:
-    """从 API 响应 JSON 中提取 full_uuid 和 short_id"""
+# ---------- 严格从 JSON 中提取【服务器】UUID（过滤账户 UUID） ----------
+def is_server_dict(d: dict) -> bool:
+    """判断一个字典是否是服务器对象，而非个人账户(user)对象"""
+    # 如果包含账户专属字段（email, username, root_admin），直接排除
+    if any(k in d for k in ("email", "username", "root_admin", "2fa", "use_totp")):
+        return False
+    # 必须包含服务器专属特征字段之一
+    server_keys = (
+        "identifier", "uuidShort", "node", "limits", "feature_limits",
+        "sftp_details", "invocation", "docker_image", "egg", "container",
+        "is_suspended", "is_installing", "server_owner"
+    )
+    return any(k in d for k in server_keys)
+
+def extract_server_uuid_from_json(data) -> Tuple[Optional[str], Optional[str]]:
+    """只从符合服务器特征的 JSON 节点中提取 full_uuid 和 short_id"""
     if isinstance(data, dict):
-        # 常见 Pterodactyl / Godlike 服务器对象结构
-        attrs = data.get("attributes", data)
-        if isinstance(attrs, dict):
-            u = attrs.get("uuid") or attrs.get("server_uuid")
-            sid = attrs.get("identifier") or attrs.get("short_id") or attrs.get("uuidShort")
+        # 情况 1: 标准 Pterodactyl 结构 {"object": "server", "attributes": {...}}
+        obj_type = data.get("object")
+        attrs = data.get("attributes")
+        if obj_type == "server" and isinstance(attrs, dict):
+            u = attrs.get("uuid")
+            sid = attrs.get("identifier") or attrs.get("uuidShort")
             if isinstance(u, str) and UUID_PATTERN.fullmatch(u):
                 return u, (sid if isinstance(sid, str) and len(sid) == 8 else u.split("-")[0])
 
+        # 情况 2: 直接是服务器字典
+        if is_server_dict(data):
+            u = data.get("uuid") or data.get("server_uuid")
+            sid = data.get("identifier") or data.get("uuidShort") or data.get("short_id")
+            if isinstance(u, str) and UUID_PATTERN.fullmatch(u):
+                return u, (sid if isinstance(sid, str) and len(sid) == 8 else u.split("-")[0])
+
+        # 递归遍历子节点（跳过 user / account 节点）
         for k, v in data.items():
-            if k in ("uuid", "server_uuid", "serverId") and isinstance(v, str) and UUID_PATTERN.fullmatch(v):
-                return v, v.split("-")[0]
-            res_u, res_s = extract_uuid_from_json(v)
+            if k in ("user", "account", "owner", "profile"):
+                continue
+            res_u, res_s = extract_server_uuid_from_json(v)
             if res_u:
                 return res_u, res_s
 
     elif isinstance(data, list):
         for item in data:
-            res_u, res_s = extract_uuid_from_json(item)
+            res_u, res_s = extract_server_uuid_from_json(item)
             if res_u:
                 return res_u, res_s
 
     return None, None
 
-# ---------- 主动请求 API 获取服务器列表 (核心兜底) ----------
+# ---------- 主动请求 API 获取服务器列表 ----------
 def fetch_server_from_api(bearer_token: str, short_id: str = None, proxy: str = None) -> Tuple[Optional[str], Optional[str], bool]:
     """
     通过 Bearer Token 直接查询 API 获取服务器 UUID
@@ -154,11 +176,9 @@ def fetch_server_from_api(bearer_token: str, short_id: str = None, proxy: str = 
 
     candidate_urls = [
         f"{API_BASE}/servers?page=1",
-        f"{API_BASE}/servers",
         "https://panel.godlike.host/api/client?page=1",
+        f"{API_BASE}/servers",
         "https://panel.godlike.host/api/client",
-        f"{FRONT_BASE}/api/client?page=1",
-        f"{FRONT_BASE}/api/v2/servers?page=1",
     ]
     if short_id:
         candidate_urls.insert(0, f"{API_BASE}/servers/{short_id}")
@@ -169,6 +189,7 @@ def fetch_server_from_api(bearer_token: str, short_id: str = None, proxy: str = 
     for url in candidate_urls:
         try:
             resp = requests.get(url, headers=headers, proxies=proxies, timeout=15)
+            print(f"[DEBUG] 主动查询 API: {url} -> 状态码 {resp.status_code}", flush=True)
             if resp.status_code != 200:
                 continue
 
@@ -177,22 +198,28 @@ def fetch_server_from_api(bearer_token: str, short_id: str = None, proxy: str = 
             except Exception:
                 continue
 
-            # 1. 尝试结构化提取
-            u, s = extract_uuid_from_json(data)
+            # 1. 严格结构化提取服务器 UUID
+            u, s = extract_server_uuid_from_json(data)
             if u:
-                print(f"[DEBUG] 通过 API ({url}) 成功获取到服务器 UUID", flush=True)
+                print(f"[DEBUG] 通过 API 成功提取服务器: {mask_server(s)}", flush=True)
                 return u, s, False
 
             # 2. 检查是否明确返回了空的服务器列表
             if isinstance(data, dict):
-                arr = data.get("data")
-                if isinstance(arr, list) and len(arr) == 0:
-                    empty_account_detected = True
+                # 常见结构: {"object": "list", "data": [], ...} 或 {"servers": []}
+                for list_key in ("data", "servers", "items"):
+                    arr = data.get(list_key)
+                    if isinstance(arr, list):
+                        print(f"[DEBUG] API 返回列表 '{list_key}' 长度: {len(arr)}", flush=True)
+                        if len(arr) == 0:
+                            empty_account_detected = True
 
-            # 3. 退化为正则全文匹配（排除 user 自身的 uuid）
-            text = resp.text
+            # 3. 如果已知 short_id，在响应全文中精确匹配该 short_id 开头的完整 UUID
             if short_id:
-                m = re.search(rf'{re.escape(short_id)}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}', text, re.I)
+                m = re.search(
+                    rf'{re.escape(short_id)}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}',
+                    resp.text, re.I
+                )
                 if m:
                     return m.group(0), short_id, False
 
@@ -218,26 +245,31 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
             if bearer_token != token:
                 bearer_token = token
         url = request.url
+        # 请求 URL 中包含 /servers/{uuid} 一定是真实的服务器 UUID
         m = re.search(r'/servers/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', url, re.I)
         if m and not full_uuid:
             full_uuid = m.group(1)
             short_id = full_uuid.split('-')[0]
+            print(f"[DEBUG] 从请求 URL 捕获服务器 UUID: {mask_server(short_id)}", flush=True)
 
     def on_response(response):
         nonlocal full_uuid, short_id
         if full_uuid:
             return
         url = response.url
-        if any(k in url for k in ("/api/", "/servers", "/client")):
+        # 排除登录、个人账户设置相关的接口，只检查服务器列表接口
+        if any(skip in url for skip in ("/auth/", "/login", "/account", "/user", "/me")):
+            return
+        if any(k in url for k in ("/servers", "/api/client")):
             try:
                 ctype = response.headers.get("content-type", "")
                 if "json" in ctype:
                     data = response.json()
-                    u, s = extract_uuid_from_json(data)
+                    u, s = extract_server_uuid_from_json(data)
                     if u:
                         full_uuid = u
                         short_id = s or u.split("-")[0]
-                        print(f"[DEBUG] 从响应拦截中获取 UUID: {mask_server(short_id)}", flush=True)
+                        print(f"[DEBUG] 从响应 JSON 捕获服务器 UUID: {mask_server(short_id)}", flush=True)
             except Exception:
                 pass
 
@@ -272,7 +304,7 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
                     page.screenshot(path="login_no_switch_btn.png")
                 except Exception:
                     pass
-                return None, None, None, "未找到登录切换按钮(可能遇到Cloudflare拦截)"
+                return None, None, None, "未找到登录切换按钮"
 
             page.wait_for_timeout(2000)
 
@@ -308,12 +340,7 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
                 print("[ERROR] 未找到登录按钮", flush=True)
                 return None, None, None, "未找到登录提交按钮"
 
-            # 等待跳转并让网络请求完成
-            page.wait_for_timeout(6000)
-            try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                pass
+            page.wait_for_timeout(5000)
             print(f"[DEBUG] 登录后 URL: {page.url}", flush=True)
 
             if '/login' in page.url:
@@ -324,21 +351,8 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
                     pass
                 return None, None, None, "登录被拒绝(密码错误或触发验证码)"
 
-            # 尝试从存储中兜底提取 ptlc_ token
-            if not bearer_token:
-                try:
-                    storage_text = page.evaluate(
-                        "() => JSON.stringify(Object.assign({}, localStorage, sessionStorage)) + ' ' + document.cookie"
-                    )
-                    m_tok = re.search(r'(ptlc_[A-Za-z0-9_\-]+)', storage_text)
-                    if m_tok:
-                        bearer_token = m_tok.group(1)
-                        print("[DEBUG] 从浏览器 Storage 中提取到 bearer_token", flush=True)
-                except Exception:
-                    pass
-
-            # 尝试点击弹窗或引导按钮，并检测服务器卡片
-            for _ in range(8):
+            # 1. 按照原版成功逻辑：点击引导按钮或服务器链接，进入 /server/ 页面以触发 /servers/{uuid} 请求
+            for _ in range(6):
                 if full_uuid:
                     break
                 for sel in [
@@ -357,7 +371,7 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
                                         short_id = parts[j + 1]
                                         break
                             el.first.click(timeout=3000)
-                            print(f"[DEBUG] 已点击页面元素: {sel}", flush=True)
+                            print(f"[DEBUG] 已点击: {sel}", flush=True)
                             page.wait_for_timeout(2500)
                             break
                     except Exception:
@@ -370,60 +384,64 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
                         if p_part == 'server' and i + 1 < len(parts) and len(parts[i + 1]) == 8:
                             short_id = parts[i + 1]
                             break
+                    # 在服务器页面多等 2 秒，让前端发出 /servers/{uuid} 请求
+                    page.wait_for_timeout(2000)
                     break
                 page.wait_for_timeout(1000)
 
-            # 如果拿到了 short_id 但还没进服务器详情页，主动跳转触发详情 API
+            # 2. 如果页面上有 a[href*="/server/"] 还没提取到 short_id，遍历提取
+            if not short_id:
+                try:
+                    links = page.locator('a[href*="/server/"]')
+                    for i in range(links.count()):
+                        href = links.nth(i).get_attribute("href") or ""
+                        parts = href.rstrip('/').split('/')
+                        for j, p_part in enumerate(parts):
+                            if p_part == 'server' and j + 1 < len(parts) and len(parts[j + 1]) == 8:
+                                short_id = parts[j + 1]
+                                break
+                        if short_id:
+                            break
+                except Exception:
+                    pass
+
+            # 3. 如果拿到了 short_id 但还没触发详情请求，主动跳转 /server/{short_id}
             if short_id and not full_uuid:
                 try:
-                    print(f"[DEBUG] 主动访问服务器详情页: {FRONT_BASE}/server/{short_id}", flush=True)
+                    print(f"[DEBUG] 主动跳转服务器页: {FRONT_BASE}/server/{short_id}", flush=True)
                     page.goto(f"{FRONT_BASE}/server/{short_id}", wait_until="domcontentloaded", timeout=30000)
                     page.wait_for_timeout(4000)
                 except Exception:
                     pass
 
-            # 从网页 HTML 源码正则兜底匹配
-            if not full_uuid:
+            # 4. 如果还是没有 full_uuid，且有了 short_id，从 HTML 源码中匹配该 short_id 对应的 UUID
+            if not full_uuid and short_id:
                 try:
                     html = page.content()
-                    if short_id:
-                        m = re.search(
-                            rf'{re.escape(short_id)}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}',
-                            html, re.I
-                        )
-                        if m:
-                            full_uuid = m.group(0)
-                    else:
-                        # 查找页面中是否存在 href="/server/xxxxxxxx"
-                        m_short = re.search(r'/server/([0-9a-f]{8})\b', html, re.I)
-                        if m_short:
-                            short_id = m_short.group(1)
-                            m_full = re.search(
-                                rf'{re.escape(short_id)}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}',
-                                html, re.I
-                            )
-                            if m_full:
-                                full_uuid = m_full.group(0)
+                    m = re.search(
+                        rf'{re.escape(short_id)}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}',
+                        html, re.I
+                    )
+                    if m:
+                        full_uuid = m.group(0)
                 except Exception:
                     pass
 
-            # 如果依然没拿到 UUID，但已经有了 bearer_token，直接调后端 API 查询！
+            # 5. 如果仍然没拿到，使用 Bearer Token 主动请求服务器列表 API
             empty_account = False
             if bearer_token and not full_uuid:
-                print("[DEBUG] 正在通过 Bearer Token 主动查询服务器列表 API...", flush=True)
+                print("[DEBUG] 页面未发现服务器，尝试通过 API 查询该账号下的服务器列表...", flush=True)
                 api_uuid, api_short, empty_account = fetch_server_from_api(bearer_token, short_id, proxy)
                 if api_uuid:
                     full_uuid = api_uuid
                     short_id = api_short or full_uuid.split('-')[0]
 
-            # 如果还是失败，截图留存并在日志打印页面可见文字方便排查
+            # 6. 如果依然没有，打印页面文字诊断为什么没有服务器
             if not full_uuid:
                 try:
-                    snap_file = f"no_uuid_{int(time.time())}.png"
-                    page.screenshot(path=snap_file, full_page=True)
-                    body_preview = page.locator("body").inner_text(timeout=3000)
-                    clean_preview = " | ".join([line.strip() for line in body_preview.splitlines() if line.strip()][:15])
-                    print(f"[DEBUG] 未获取到 UUID 时页面文本预览: {clean_preview}", flush=True)
+                    body_text = page.locator("body").inner_text(timeout=3000)
+                    lines = [line.strip() for line in body_text.splitlines() if line.strip()]
+                    print(f"[DEBUG] 面板首页可见内容: {' | '.join(lines[:20])}", flush=True)
                 except Exception:
                     pass
 
@@ -431,9 +449,9 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
             print(f"[DEBUG] bearer_token: {'已获取' if bearer_token else '未获取'}, short_id: {short_id or '未获取'}", flush=True)
 
             if empty_account and not full_uuid:
-                return bearer_token, None, None, "该账号下暂无服务器(可能未创建或过期已被系统回收)"
+                return bearer_token, None, None, "该账号下无服务器(可能过期未续期已被官方删除)"
 
-            return bearer_token, full_uuid, short_id, ("未能获取服务器 UUID" if not full_uuid else "")
+            return bearer_token, full_uuid, short_id, ("未能获取服务器 UUID(账号下可能已无服务器)" if not full_uuid else "")
 
         except Exception as e:
             print(f"[ERROR] 登录异常: {e}", flush=True)
